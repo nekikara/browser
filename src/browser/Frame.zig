@@ -589,6 +589,11 @@ pub fn viewportChanged(self: *Frame) void {
 
 pub fn trackWorker(self: *Frame, worker: *Worker) !void {
     try self.workers.append(self.page_arena, worker);
+    if (self.main_js.retired) {
+        // created by the JS of a frame that was just discarded (see retire)
+        worker.terminate();
+        self._session.browser.env.retireContext(worker._worker_scope._proto.js);
+    }
 }
 
 pub fn removeWorker(self: *Frame, worker: *Worker) void {
@@ -1349,6 +1354,33 @@ pub fn discard(self: *Frame) !void {
     self.neuter();
     self.abortTransfers();
     page.closed_frames.appendAssumeCapacity(self);
+    self.retire();
+}
+
+// The contexts of the frame, of its descendants and of the workers they own,
+// stop for good and no longer count against Env's MAX_CONTEXTS (see
+// Env.retireContext). Nothing is freed: the Frame, its Window and the
+// v8::Contexts stay until Page.deinit, as the Window can still be referenced,
+// and the frame's JS can still be on the stack.
+fn retire(self: *Frame) void {
+    const env = &self._session.browser.env;
+    if (self.main_js.retired) {
+        return;
+    }
+
+    for (self.child_frames.items) |child| {
+        child.retire();
+    }
+
+    // A dedicated worker is terminated with its owner document.
+    for (self.workers.items) |worker| {
+        worker.terminate();
+        env.retireContext(worker._worker_scope._proto.js);
+    }
+
+    // e.g. CDP retires the frame's isolated worlds
+    self._session.notification.dispatch(.frame_retired, self);
+    env.retireContext(self.main_js);
 }
 
 fn neuter(self: *Frame) void {
@@ -4678,4 +4710,54 @@ test "Frame: iframeAddedCallback does not create a frame when termination is pen
     try frame.iframeAddedCallback(iframe);
     try testing.expectEqual(contexts_before, env.contexts.items.len);
     try testing.expectEqual(false, iframe._executed);
+}
+
+test "Frame: a discarded frame's context is retired and drops the tasks queued after" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const session = frame._session;
+    const subframe_loading_enabled = session.load_resources.iframe;
+    session.load_resources.iframe = true;
+    defer session.load_resources.iframe = subframe_loading_enabled;
+
+    const element = try frame.document.createElement("iframe", null, frame);
+    const iframe = element.as(HtmlElement.IFrame);
+
+    const env = frame.js.env;
+    const contexts_before = env.contexts.items.len;
+    const retired_before = env.retired_count;
+
+    try frame.iframeAddedCallback(iframe);
+    const child = iframe._window.?._frame;
+    const ctx = child.main_js;
+    try testing.expectEqual(contexts_before + 1, env.contexts.items.len);
+
+    try child.discard();
+    try testing.expectEqual(true, ctx.retired);
+    // still allocated, but no longer counted as live
+    try testing.expectEqual(contexts_before + 1, env.contexts.items.len);
+    try testing.expectEqual(retired_before + 1, env.retired_count);
+
+    const Task = struct {
+        ran: bool = false,
+        finalized: bool = false,
+        fn run(p: *anyopaque) !?u32 {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.ran = true;
+            return null;
+        }
+        fn finalize(p: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.finalized = true;
+        }
+    };
+    var task: Task = .{};
+    try ctx.scheduler.add(&task, Task.run, 0, .{ .name = "test.retired", .finalizer = Task.finalize });
+    try env.runMacrotasks();
+    try testing.expectEqual(false, task.ran);
+    try testing.expectEqual(true, task.finalized);
+
+    testing.test_session.closeAllPages();
+    try testing.expectEqual(retired_before, env.retired_count);
 }

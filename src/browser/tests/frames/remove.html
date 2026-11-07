@@ -166,3 +166,173 @@
     });
   }
 </script>
+
+<!-- a removed iframe's context is retired, so it no longer counts against
+     Env's MAX_CONTEXTS (128 outside of WPT builds) -->
+<script id=removed_frames_release_their_context type=module>
+  {
+    const state = await testing.async();
+
+    let loaded = 0;
+    for (let i = 0; i < 200; i++) {
+      const f = document.createElement('iframe');
+      f.srcdoc = '<p>child</p>';
+      await new Promise((resolve) => {
+        f.onload = resolve;
+        document.body.appendChild(f);
+      });
+      if (f.contentDocument.querySelector('p').textContent === 'child') {
+        loaded += 1;
+      }
+      f.remove();
+    }
+    state.resolve(loaded);
+
+    await state.done((loaded) => {
+      testing.expectEqual(200, loaded);
+    });
+  }
+</script>
+
+<!-- the Window of a retired context is still usable from JS -->
+<script id=retired_window_stays_usable type=module>
+  {
+    const state = await testing.async();
+
+    const f = document.createElement('iframe');
+    f.srcdoc = '<script>window.answer = 42; window.timer_id = setInterval(() => {}, 5)<\/script>';
+    f.onload = () => {
+      const win = f.contentWindow;
+      const doc = f.contentDocument;
+      f.remove();
+      // use it from a later task, not the one that removed it
+      setTimeout(() => state.resolve({ win, doc }), 10);
+    };
+    document.body.appendChild(f);
+
+    await state.done(({ win, doc }) => {
+      testing.expectEqual(true, win.closed);
+      testing.expectEqual(42, win.answer);
+      testing.expectEqual(doc, win.document);
+      testing.expectEqual(null, doc.defaultView);
+      win.clearInterval(win.timer_id);
+      testing.expectEqual('P', doc.createElement('p').tagName);
+    });
+  }
+</script>
+
+<!-- a removed iframe's promise jobs still run (e.g. its streams keep working),
+     only its tasks don't -->
+<script id=retired_context_runs_microtasks type=module>
+  {
+    const state = await testing.async();
+
+    const f = document.createElement('iframe');
+    f.srcdoc = '<p>child</p>';
+    f.onload = () => {
+      const win = f.contentWindow;
+      // the reaction is the iframe's, so its job goes to the iframe's queue
+      const resolve = win.eval('let r; window.p = new Promise((res) => r = res).then((x) => x + 1); r');
+      const p = win.p;
+      f.remove();
+      resolve(41);
+      p.then((v) => state.resolve(v));
+    };
+    document.body.appendChild(f);
+
+    await state.done((v) => {
+      testing.expectEqual(42, v);
+    });
+  }
+</script>
+
+<!-- tasks queued for a removed iframe after its removal don't run either -->
+<script id=retired_context_drops_later_tasks type=module>
+  {
+    const state = await testing.async();
+
+    const f = document.createElement('iframe');
+    f.srcdoc = '<script>onmessage = () => parent.retired_ran.push("message")<\/script>';
+    f.onload = () => {
+      window.retired_ran = [];
+      const win = f.contentWindow;
+      f.remove();
+      win.setTimeout(() => window.retired_ran.push('timeout'), 0);
+      win.postMessage('x', '*');
+      // a timer the removed iframe sets itself, from one of its promise jobs
+      win.eval('Promise.resolve().then(() => setTimeout(() => parent.retired_ran.push("own timeout"), 0))');
+      setTimeout(() => state.resolve(window.retired_ran), 20);
+    };
+    document.body.appendChild(f);
+
+    await state.done((ran) => {
+      testing.expectEqual('[]', JSON.stringify(ran));
+    });
+  }
+</script>
+
+<!-- promise jobs keep their order across contexts when an iframe is removed:
+     neither another iframe's job (queued before) nor the removed iframe's job
+     (queued by the parent) is pushed past the next task -->
+<script id=retire_keeps_microtask_order type=module>
+  {
+    const state = await testing.async();
+
+    const addFrame = () => new Promise((resolve) => {
+      const f = document.createElement('iframe');
+      f.srcdoc = '<p>c</p>';
+      f.onload = () => resolve(f);
+      document.body.appendChild(f);
+    });
+    const a = await addFrame();
+    const b = await addFrame();
+    const c = await addFrame();
+
+    const log = [];
+    window.order_log = log;
+    window.order_remove_a = () => {
+      a.remove();
+      log.push('a removed');
+    };
+    // c's reaction, triggered by the parent once c is removed
+    const resolve_c = c.contentWindow.eval('let r; new Promise((res) => r = res).then(() => parent.order_log.push("c job")); r');
+    setTimeout(() => {
+      a.contentWindow.eval('Promise.resolve().then(() => parent.order_remove_a())');
+      b.contentWindow.eval('Promise.resolve().then(() => parent.order_log.push("b job"))');
+      c.remove();
+      Promise.resolve().then(() => resolve_c());
+    }, 0);
+    setTimeout(() => log.push('next task'), 0);
+    setTimeout(() => state.resolve(log), 20);
+
+    await state.done((log) => {
+      testing.expectEqual('["a removed","b job","c job","next task"]', JSON.stringify(log));
+    });
+  }
+</script>
+
+<!-- a removed iframe's dedicated workers go with it -->
+<script id=removed_frames_release_their_workers type=module>
+  {
+    const state = await testing.async();
+
+    let loaded = 0;
+    for (let i = 0; i < 200; i++) {
+      const f = document.createElement('iframe');
+      f.srcdoc = '<script>window.worker = new Worker("data:text/javascript,")<\/script>';
+      await new Promise((resolve) => {
+        f.onload = resolve;
+        document.body.appendChild(f);
+      });
+      if (f.contentWindow.worker instanceof f.contentWindow.Worker) {
+        loaded += 1;
+      }
+      f.remove();
+    }
+    state.resolve(loaded);
+
+    await state.done((loaded) => {
+      testing.expectEqual(200, loaded);
+    });
+  }
+</script>

@@ -45,6 +45,12 @@ const Allocator = std.mem.Allocator;
 
 const MAX_CONTEXTS = if (lp.build_config.wpt_extensions) 8192 else 128;
 
+// Retired contexts (removed iframes, closed popups: see retireContext) don't
+// count against MAX_CONTEXTS, but nothing of them is freed until their Page is
+// torn down. This bounds what a page that keeps replacing iframes holds on to
+// (about 0.4MB for a trivial iframe).
+const MAX_RETIRED_CONTEXTS = if (lp.build_config.wpt_extensions) 8192 else 1024;
+
 const GC_HINT_FLOOR = 1 * 1024 * 1024;
 
 fn initClassIds() void {
@@ -73,6 +79,9 @@ platform: *const Platform,
 isolate: js.Isolate,
 
 contexts: std.ArrayList(*Context),
+
+// How many of contexts are retired (see retireContext).
+retired_count: usize = 0,
 
 // just kept around because we need to free it on deinit
 isolate_params: *v8.CreateParams,
@@ -405,7 +414,8 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
     // a v8 context, we can get our context out
     v8.v8__Context__SetAlignedPointerInEmbedderData(v8_context, 1, @ptrCast(context));
 
-    if (self.contexts.items.len >= MAX_CONTEXTS) {
+    const live = self.contexts.items.len - self.retired_count;
+    if (live >= MAX_CONTEXTS or self.retired_count >= MAX_RETIRED_CONTEXTS) {
         return error.TooManyContexts;
     }
     try self.contexts.append(self.allocator, context);
@@ -476,6 +486,29 @@ pub fn destroyContext(self: *Env, context: *Context) void {
         }
     }
 
+    if (context.retired) {
+        // the inspector was told at retireContext
+        self.retired_count -= 1;
+    } else {
+        self.inspectorContextDestroyed(context);
+    }
+    context.deinit();
+}
+
+// The context of a discarded frame (see Context.retire). It stays in contexts,
+// allocated, until destroyContext, as its JS can still be on the stack and its
+// objects still be used. Its microtasks keep running, like the rest of the
+// page's, but it no longer runs tasks, nor counts against MAX_CONTEXTS.
+pub fn retireContext(self: *Env, context: *Context) void {
+    if (context.retired) {
+        return;
+    }
+    context.retire();
+    self.retired_count += 1;
+    self.inspectorContextDestroyed(context);
+}
+
+fn inspectorContextDestroyed(self: *Env, context: *Context) void {
     const isolate = self.isolate;
     if (self.inspector) |inspector| {
         var hs: js.HandleScope = undefined;
@@ -483,8 +516,6 @@ pub fn destroyContext(self: *Env, context: *Context) void {
         defer hs.deinit();
         inspector.contextDestroyed(@ptrCast(v8.v8__Global__Get(&context.handle, isolate.handle)));
     }
-
-    context.deinit();
 }
 
 pub fn runMicrotasks(self: *Env) void {
@@ -559,8 +590,9 @@ fn reportRejectedPromises(self: *Env, ctx: *Context) bool {
         if (self.terminatePending()) {
             break;
         }
-        // A listener removed the frame this context belonged to.
-        if (std.mem.findScalar(*Context, self.contexts.items, ctx) == null) {
+        // A discarded frame has no document to report to (a listener may just
+        // have removed it).
+        if (ctx.retired or std.mem.findScalar(*Context, self.contexts.items, ctx) == null) {
             return false;
         }
 
@@ -619,6 +651,15 @@ pub fn runMacrotasks(self: *Env) !void {
     var i: usize = 0;
     while (i < self.contexts.items.len) : (i += 1) {
         const ctx = self.contexts.items[i];
+        if (ctx.retired) {
+            // A discarded frame's tasks never run. Drop what was queued since
+            // it was retired (e.g. a parent's postMessage to it), rather than
+            // keep it until the page is torn down.
+            if (ctx.scheduler.msToNext() != null) {
+                ctx.scheduler.reset();
+            }
+            continue;
+        }
         if (comptime lp.IS_TEST == false) {
             // I hate this comptime check as much as you do. But we have tests
             // which rely on short execution before shutdown. In real world, it's
@@ -638,6 +679,9 @@ pub fn runMacrotasks(self: *Env) !void {
 
 pub fn hasMacrotasks(self: *Env) bool {
     for (self.contexts.items) |ctx| {
+        if (ctx.retired) {
+            continue;
+        }
         if (ctx.scheduler.blocksCompletion()) {
             return true;
         }
@@ -648,6 +692,9 @@ pub fn hasMacrotasks(self: *Env) bool {
 pub fn msToNextTask(self: *Env) ?u64 {
     var next_task: u64 = std.math.maxInt(u64);
     for (self.contexts.items) |ctx| {
+        if (ctx.retired) {
+            continue;
+        }
         const candidate = ctx.scheduler.msToNext() orelse continue;
         next_task = @min(candidate, next_task);
     }

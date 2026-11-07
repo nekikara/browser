@@ -617,6 +617,7 @@ pub const BrowserContext = struct {
         try notification.register(.frame_child_frame_created, self, onFrameChildFrameCreated);
         try notification.register(.frame_child_frame_detached, self, onFrameChildFrameDetached);
         try notification.register(.frame_destroyed, self, onFrameDestroyed);
+        try notification.register(.frame_retired, self, onFrameRetired);
         try notification.register(.frame_dom_content_loaded, self, onFrameDOMContentLoaded);
         try notification.register(.frame_loaded, self, onFrameLoaded);
         try notification.register(.javascript_dialog_opening, self, onJavascriptDialogOpening);
@@ -1072,6 +1073,11 @@ pub const BrowserContext = struct {
     fn onFrameDestroyed(ctx: *anyopaque, frame: *const Frame) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
         @import("domains/page.zig").frameDestroyed(self, frame);
+    }
+
+    fn onFrameRetired(ctx: *anyopaque, frame: *const Frame) !void {
+        const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        return @import("domains/page.zig").frameRetired(self, frame);
     }
 
     fn onFrameChildFrameCreated(ctx: *anyopaque, msg: *const Notification.FrameChildFrameCreated) !void {

@@ -85,6 +85,10 @@ local_arena: Allocator,
 // the call which is calling the callback.
 call_depth: usize = 0,
 
+// Set by Env.retireContext: the context no longer runs tasks, but its
+// v8::Context is kept until Env.destroyContext. See retire.
+retired: bool = false,
+
 // When a Caller is active (V8->Zig callback), this points to its Local.
 // When null, Zig->V8 calls must create a js.Local.Scope and initialize via
 // context.localScope
@@ -197,6 +201,20 @@ pub fn fromIsolate(isolate: js.Isolate) ?struct { *Context, *const v8.Context } 
     const v8_incumbent = v8.v8__Isolate__GetIncumbentContext(isolate.handle) orelse return null;
     const ctx = fromC(v8_incumbent) orelse return null;
     return .{ ctx, v8_incumbent };
+}
+
+// The context of a discarded frame (a removed iframe, a closed popup), whose
+// document is no longer fully active: its tasks never run again (Env drops
+// those queued later, e.g. a parent's postMessage to it), but its promise jobs
+// do, so its streams or WebCrypto calls still settle. Its Window can still be
+// referenced from JS, and its JS can even still be running (e.g. it removed its
+// own iframe), so nothing is released: the global stays attached, and the
+// v8::Context and this struct are kept until Env.destroyContext. Called by
+// Env.retireContext.
+pub fn retire(self: *Context) void {
+    self.page.session.idb.detachContext(self);
+    self.scheduler.reset();
+    self.retired = true;
 }
 
 pub fn deinit(self: *Context) void {

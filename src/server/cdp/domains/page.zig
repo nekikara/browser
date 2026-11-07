@@ -699,6 +699,16 @@ pub fn frameDestroyed(bc: *CDP.BrowserContext, frame: *const Frame) void {
     }
 }
 
+// Fired when a frame is discarded: its isolated worlds stop too, but are only
+// destroyed by frameDestroyed, as their JS can still be on the stack.
+pub fn frameRetired(bc: *CDP.BrowserContext, frame: *const Frame) void {
+    const env = &bc.session.browser.env;
+    for (bc.isolated_worlds.items) |isolated_world| {
+        const ctx = isolated_world.contextFor(frame) orelse continue;
+        env.retireContext(ctx);
+    }
+}
+
 pub fn frameChildFrameCreated(bc: *CDP.BrowserContext, event: *const Notification.FrameChildFrameCreated) !void {
     const session_id = bc.session_id orelse return;
 
